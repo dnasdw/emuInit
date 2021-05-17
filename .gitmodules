@@ -1,0 +1,12 @@
+[submodule "cmake"]
+	path = cmake
+	url = https://github.com/dnasdw/libsundaowen_cmake.git
+[submodule "dep/libsundaowen"]
+	path = dep/libsundaowen
+	url = https://github.com/dnasdw/libsundaowen_src.git
+[submodule "dep/ELFIO"]
+	path = dep/ELFIO
+	url = https://github.com/dnasdw/ELFIO.git
+[submodule "dep/unicorn"]
+	path = dep/unicorn
+	url = https://github.com/dnasdw/unicorn.git
