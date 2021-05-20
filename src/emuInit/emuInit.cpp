@@ -16,6 +16,22 @@ int UMain(int argc, UChar* argv[])
 	{
 		return 1;
 	}
+	FILE* fp = UFopen(argv[1], USTR("rb"), false);
+	if (fp == nullptr)
+	{
+		return 1;
+	}
+	fseek(fp, 0, SEEK_END);
+	u32 uElfSize = ftell(fp);
+	if (uElfSize == 0)
+	{
+		fclose(fp);
+		return 1;
+	}
+	fseek(fp, 0, SEEK_SET);
+	vector<u8> vElf(uElfSize);
+	fread(&*vElf.begin(), 1, vElf.size(), fp);
+	fclose(fp);
 	elfio elfFile;
 	ifstream input;
 	input.open(argv[1], ios::in | ios::binary);
@@ -70,6 +86,7 @@ int UMain(int argc, UChar* argv[])
 	n32 nBssIndex = -1;
 	n32 nInitArrayIndex = -1;
 	n32 nRelaDynIndex = -1;
+	u64 uTextAddressMin = 0;
 	u64 uTextAddressMax = 0;
 	u64 uBasicAddressMin = UINT32_MAX;
 	u64 uBasicAddressMax = 0;
@@ -87,6 +104,7 @@ int UMain(int argc, UChar* argv[])
 		if (sName == ".text")
 		{
 			nTextIndex = i;
+			uTextAddressMin = uAddress;
 			uTextAddressMax = uAddress + uSize;
 			if (uAddress < uBasicAddressMin)
 			{
@@ -145,13 +163,13 @@ int UMain(int argc, UChar* argv[])
 	if (nTextIndex == -1 || nDataIndex == -1 || nInitArrayIndex == -1)
 	{
 		// support .text and .data and .init_array only
-		ofstream output;
-		output.open(argv[2], ios::out | ios::binary | ios::trunc);
-		if (!output)
+		fp = UFopen(argv[2], USTR("wb"), false);
+		if (fp == nullptr)
 		{
 			return 1;
 		}
-		elfFile.save(output);
+		fwrite(&*vElf.begin(), 1, vElf.size(), fp);
+		fclose(fp);
 		return 0;
 	}
 	section* pTextSection = elfFile.sections[nTextIndex];
@@ -174,13 +192,13 @@ int UMain(int argc, UChar* argv[])
 	}
 	if (pTextSection->get_size() == 0 || pDataSection->get_size() == 0 || pInitArraySection->get_size() == 0)
 	{
-		ofstream output;
-		output.open(argv[2], ios::out | ios::binary | ios::trunc);
-		if (!output)
+		fp = UFopen(argv[2], USTR("wb"), false);
+		if (fp == nullptr)
 		{
 			return 1;
 		}
-		elfFile.save(output);
+		fwrite(&*vElf.begin(), 1, vElf.size(), fp);
+		fclose(fp);
 		return 0;
 	}
 	u64 uMemoryAddress4K = uBasicAddressMin / 4096 * 4096;
@@ -190,20 +208,21 @@ int UMain(int argc, UChar* argv[])
 		return 1;
 	}
 	string sMemory(uMemorySize4K, 0);
-	memcpy(&*sMemory.begin() + (pTextSection->get_address() - uMemoryAddress4K), pTextSection->get_data(), static_cast<u32>(pTextSection->get_size()));
+	memcpy(&*sMemory.begin() + static_cast<u32>(pTextSection->get_address() - uMemoryAddress4K), pTextSection->get_data(), static_cast<u32>(pTextSection->get_size()));
 	if (pRodataSection != nullptr)
 	{
-		memcpy(&*sMemory.begin() + (pRodataSection->get_address() - uMemoryAddress4K), pRodataSection->get_data(), static_cast<u32>(pRodataSection->get_size()));
+		memcpy(&*sMemory.begin() + static_cast<u32>(pRodataSection->get_address() - uMemoryAddress4K), pRodataSection->get_data(), static_cast<u32>(pRodataSection->get_size()));
 	}
-	memcpy(&*sMemory.begin() + (pDataSection->get_address() - uMemoryAddress4K), pDataSection->get_data(), static_cast<u32>(pDataSection->get_size()));
+	memcpy(&*sMemory.begin() + static_cast<u32>(pDataSection->get_address() - uMemoryAddress4K), pDataSection->get_data(), static_cast<u32>(pDataSection->get_size()));
+	map<n32, n32> mInitArrayRelaDynIndex;
 	if (pRelaDynSection != nullptr)
 	{
 		relocation_section_accessor relaDynSection(elfFile, pRelaDynSection);
 		u64 uInitArrayAddress = pInitArraySection->get_address();
 		u64 uInitArraySize = pInitArraySection->get_size();
 		string sInitArrayData(pInitArraySection->get_data(), static_cast<u32>(uInitArraySize));
-		u64 uEnteyCount = relaDynSection.get_entries_num();
-		for (u64 i = 0; i < uEnteyCount; i++)
+		n32 nEnteyCount = static_cast<n32>(relaDynSection.get_entries_num());
+		for (n32 i = 0; i < nEnteyCount; i++)
 		{
 			Elf64_Addr uOffset = 0;
 			Elf_Word uSymbol = 0;
@@ -213,16 +232,15 @@ int UMain(int argc, UChar* argv[])
 			{
 				return 1;
 			}
-			if (uSymbol == 0 && uType == 1027/* R_AARCH64_RELATIVE Adjust by program base. */ && uOffset >= uInitArrayAddress && uOffset + 8 <= uInitArrayAddress + uInitArraySize && !sInitArrayData.empty())
+			if (uMachine == kMachineARM && uSymbol == 0 && uType == 23/* R_ARM_RELATIVE Adjust by program base. */ && uOffset >= uInitArrayAddress && uOffset + 4 <= uInitArrayAddress + uInitArraySize && !sInitArrayData.empty())
 			{
-				if (uClass == ELFCLASS32)
-				{
-					memcpy(&*sInitArrayData.begin() + (uOffset - uInitArrayAddress), &nAddend, sizeof(Elf32_Rela::r_addend));
-				}
-				else if (uClass == ELFCLASS64)
-				{
-					memcpy(&*sInitArrayData.begin() + (uOffset - uInitArrayAddress), &nAddend, sizeof(Elf64_Rela::r_addend));
-				}
+				mInitArrayRelaDynIndex.insert(make_pair(static_cast<n32>((uOffset - uInitArrayAddress) / 4), i));
+				memcpy(&*sInitArrayData.begin() + static_cast<u32>(uOffset - uInitArrayAddress), &nAddend, 4);
+			}
+			else if (uMachine == kMachineAARCH64 && uSymbol == 0 && uType == 1027/* R_AARCH64_RELATIVE Adjust by program base. */ && uOffset >= uInitArrayAddress && uOffset + 8 <= uInitArrayAddress + uInitArraySize && !sInitArrayData.empty())
+			{
+				mInitArrayRelaDynIndex.insert(make_pair(static_cast<n32>((uOffset - uInitArrayAddress) / 8), i));
+				memcpy(&*sInitArrayData.begin() + static_cast<u32>(uOffset - uInitArrayAddress), &nAddend, 8);
 			}
 		}
 		pInitArraySection->set_data(sInitArrayData);
@@ -248,7 +266,7 @@ int UMain(int argc, UChar* argv[])
 		{
 			continue;
 		}
-		if (uAddress >= uTextAddressMax)
+		if (uAddress < uTextAddressMin || uAddress >= uTextAddressMax)
 		{
 			return 1;
 		}
@@ -264,75 +282,97 @@ int UMain(int argc, UChar* argv[])
 			{
 				eErr = uc_open(UC_ARCH_ARM, UC_MODE_THUMB, &pUc);
 			}
-			if (eErr != UC_ERR_OK)
-			{
-				printf("Failed on uc_open() with error returned: %u (%s)\n", eErr, uc_strerror(eErr));
-				return 1;
-			}
-			eErr = uc_mem_map_ptr(pUc, uMemoryAddress4K, uMemorySize4K, UC_PROT_ALL, &*sMemory.begin());
-			eErr = uc_mem_map(pUc, 0x60000000, 0x200000, UC_PROT_READ | UC_PROT_WRITE);
-			u32 uSP = 0x60100000;
-			eErr = uc_reg_write(pUc, UC_ARM_REG_SP, &uSP);
-			u32 uLR = 0x68000000;
-			eErr = uc_reg_write(pUc, UC_ARM_REG_LR, &uLR);
-			u32 uPC = 0x00000000;
-			eErr = uc_reg_write(pUc, UC_ARM_REG_PC, &uPC);
-			eErr = uc_emu_start(pUc, uAddress, uTextAddressMax - uAddress, 10000000, 0);
-			if (eErr == UC_ERR_OK)
-			{
-				memcpy(&*sMemory.begin() + (pDataSection->get_address() - uMemoryAddress4K), &*vData.begin(), vData.size());
-				if (!vBss.empty())
-				{
-					memcpy(&*sMemory.begin() + (pBssSection->get_address() - uMemoryAddress4K), &*vBss.begin(), vBss.size());
-				}
-			}
-			else if (eErr == UC_ERR_FETCH_UNMAPPED)
-			{
-				eErr = uc_reg_read(pUc, UC_ARM_REG_PC, &uPC);
-				if (uPC != uLR)
-				{
-					eErr = uc_close(pUc);
-					return 1;
-				}
-				if (memcmp(&*sMemory.begin() + (pDataSection->get_address() - uMemoryAddress4K), &*vData.begin(), vData.size()) != 0 && (vBss.empty() || memcmp(&*sMemory.begin() + (pBssSection->get_address() - uMemoryAddress4K), &*vBss.begin(), vBss.size()) == 0))
-				{
-					sInvalidIndex.insert(i);
-					memcpy(&*vData.begin(), &*sMemory.begin() + (pDataSection->get_address() - uMemoryAddress4K), vData.size());
-					if (!vBss.empty())
-					{
-						memcpy(&*vBss.begin(), &*sMemory.begin() + (pBssSection->get_address() - uMemoryAddress4K), vBss.size());
-					}
-				}
-				else
-				{
-					memcpy(&*sMemory.begin() + (pDataSection->get_address() - uMemoryAddress4K), &*vData.begin(), vData.size());
-					if (!vBss.empty())
-					{
-						memcpy(&*sMemory.begin() + (pBssSection->get_address() - uMemoryAddress4K), &*vBss.begin(), vBss.size());
-					}
-				}
-			}
-			else
-			{
-				eErr = uc_emu_stop(pUc);
-				eErr = uc_close(pUc);
-				return 1;
-			}
-			eErr = uc_emu_stop(pUc);
-			eErr = uc_close(pUc);
 		}
 		else if (uMachine == kMachineAARCH64)
 		{
 			eErr = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &pUc);
-			if (eErr != UC_ERR_OK)
-			{
-				printf("Failed on uc_open() with error returned: %u (%s)\n", eErr, uc_strerror(eErr));
-				return 1;
-			}
-			// TODO AARCH64
 		}
+		if (eErr != UC_ERR_OK)
+		{
+			printf("Failed on uc_open() with error returned: %u (%s)\n", eErr, uc_strerror(eErr));
+			return 1;
+		}
+		eErr = uc_mem_map_ptr(pUc, uMemoryAddress4K, uMemorySize4K, UC_PROT_ALL, &*sMemory.begin());
+		eErr = uc_mem_map(pUc, 0x60000000, 0x200000, UC_PROT_READ | UC_PROT_WRITE);
+		n32 nSPRegId = -1;
+		n32 nLRRegId = -1;
+		n32 nPCRegId = -1;
+		if (uMachine == kMachineARM)
+		{
+			nSPRegId = UC_ARM_REG_SP;
+			nLRRegId = UC_ARM_REG_LR;
+			nPCRegId = UC_ARM_REG_PC;
+		}
+		else if (uMachine == kMachineAARCH64)
+		{
+			nSPRegId = UC_ARM64_REG_SP;
+			nLRRegId = UC_ARM64_REG_LR;
+			nPCRegId = UC_ARM64_REG_PC;
+		}
+		u64 uSP = 0x60100000;
+		eErr = uc_reg_write(pUc, nSPRegId, &uSP);
+		u64 uLR = 0x68000000;
+		eErr = uc_reg_write(pUc, nLRRegId, &uLR);
+		u64 uPC = 0x00000000;
+		eErr = uc_reg_write(pUc, nPCRegId, &uPC);
+		eErr = uc_emu_start(pUc, uAddress, uTextAddressMax - uAddress, 10000000, 0);
+		if (eErr == UC_ERR_OK)
+		{
+			// timeout
+			memcpy(&*sMemory.begin() + static_cast<u32>(pDataSection->get_address() - uMemoryAddress4K), &*vData.begin(), vData.size());
+			if (!vBss.empty())
+			{
+				memcpy(&*sMemory.begin() + static_cast<u32>(pBssSection->get_address() - uMemoryAddress4K), &*vBss.begin(), vBss.size());
+			}
+		}
+		else if (eErr == UC_ERR_FETCH_UNMAPPED)
+		{
+			eErr = uc_reg_read(pUc, nPCRegId, &uPC);
+			if (uPC != uLR)
+			{
+				if (uPC < uTextAddressMin || uPC >= uTextAddressMax)
+				{
+					memcpy(&*sMemory.begin() + static_cast<u32>(pDataSection->get_address() - uMemoryAddress4K), &*vData.begin(), vData.size());
+					if (!vBss.empty())
+					{
+						memcpy(&*sMemory.begin() + static_cast<u32>(pBssSection->get_address() - uMemoryAddress4K), &*vBss.begin(), vBss.size());
+					}
+				}
+				else
+				{
+					eErr = uc_emu_stop(pUc);
+					eErr = uc_close(pUc);
+					return 1;
+				}
+			}
+			else if (memcmp(&*sMemory.begin() + static_cast<u32>(pDataSection->get_address() - uMemoryAddress4K), &*vData.begin(), vData.size()) != 0 && (vBss.empty() || memcmp(&*sMemory.begin() + static_cast<u32>(pBssSection->get_address() - uMemoryAddress4K), &*vBss.begin(), vBss.size()) == 0))
+			{
+				sInvalidIndex.insert(i);
+				memcpy(&*vData.begin(), &*sMemory.begin() + static_cast<u32>(pDataSection->get_address() - uMemoryAddress4K), vData.size());
+				if (!vBss.empty())
+				{
+					memcpy(&*vBss.begin(), &*sMemory.begin() + static_cast<u32>(pBssSection->get_address() - uMemoryAddress4K), vBss.size());
+				}
+			}
+			else
+			{
+				memcpy(&*sMemory.begin() + static_cast<u32>(pDataSection->get_address() - uMemoryAddress4K), &*vData.begin(), vData.size());
+				if (!vBss.empty())
+				{
+					memcpy(&*sMemory.begin() + static_cast<u32>(pBssSection->get_address() - uMemoryAddress4K), &*vBss.begin(), vBss.size());
+				}
+			}
+		}
+		else
+		{
+			eErr = uc_emu_stop(pUc);
+			eErr = uc_close(pUc);
+			return 1;
+		}
+		eErr = uc_emu_stop(pUc);
+		eErr = uc_close(pUc);
 	}
-	pDataSection->set_data(&*sMemory.begin() + static_cast<u32>(pDataSection->get_address() - uMemoryAddress4K), static_cast<u32>(pDataSection->get_size()));
+	memcpy(&*vElf.begin() + static_cast<u32>(pDataSection->get_offset()), &*sMemory.begin() + static_cast<u32>(pDataSection->get_address() - uMemoryAddress4K), static_cast<u32>(pDataSection->get_size()));
 	if (!sInvalidIndex.empty())
 	{
 		string sInitArrayData(pInitArraySection->get_data(), static_cast<u32>(pInitArraySection->get_size()));
@@ -340,25 +380,85 @@ int UMain(int argc, UChar* argv[])
 		{
 			for (set<n32>::const_iterator it = sInvalidIndex.begin(); it != sInvalidIndex.end(); ++it)
 			{
-				*reinterpret_cast<n32*>(&*sInitArrayData.begin() + *it * 4) = -1;
+				n32 nInvalidIndex = *it;
+				*reinterpret_cast<n32*>(&*sInitArrayData.begin() + nInvalidIndex * 4) = -1;
 			}
 		}
 		else if (uClass == ELFCLASS64)
 		{
 			for (set<n32>::const_iterator it = sInvalidIndex.begin(); it != sInvalidIndex.end(); ++it)
 			{
-				*reinterpret_cast<n64*>(&*sInitArrayData.begin() + *it * 8) = -1;
+				n32 nInvalidIndex = *it;
+				*reinterpret_cast<n64*>(&*sInitArrayData.begin() + nInvalidIndex * 8) = -1;
 			}
 		}
 		pInitArraySection->set_data(sInitArrayData);
-		// TODO .rela.dyn section
+		if (pRelaDynSection == nullptr)
+		{
+			memcpy(&*vElf.begin() + static_cast<u32>(pInitArraySection->get_offset()), &*sInitArrayData.begin(), sInitArrayData.size());
+		}
+		else
+		{
+			relocation_section_accessor relaDynSection(elfFile, pRelaDynSection);
+			if (uClass == ELFCLASS32)
+			{
+				for (set<n32>::const_iterator it = sInvalidIndex.begin(); it != sInvalidIndex.end(); ++it)
+				{
+					n32 nInvalidIndex = *it;
+					map<n32, n32>::const_iterator itRelaDyn = mInitArrayRelaDynIndex.find(nInvalidIndex);
+					if (itRelaDyn == mInitArrayRelaDynIndex.end())
+					{
+						memcpy(&*vElf.begin() + static_cast<u32>(pInitArraySection->get_offset() + nInvalidIndex * 4), &*sInitArrayData.begin() + nInvalidIndex + 4, 4);
+					}
+					else
+					{
+						n32 nRelaDynIndex = itRelaDyn->second;
+						Elf64_Addr uOffset = 0;
+						Elf_Word uSymbol = 0;
+						Elf_Word uType = 0;
+						Elf_Sxword nAddend = 0;
+						if (!relaDynSection.get_entry(nRelaDynIndex, uOffset, uSymbol, uType, nAddend))
+						{
+							return 1;
+						}
+						relaDynSection.set_entry(nRelaDynIndex, uOffset, uSymbol, uType, -1);
+					}
+				}
+			}
+			else if (uClass == ELFCLASS64)
+			{
+				for (set<n32>::const_iterator it = sInvalidIndex.begin(); it != sInvalidIndex.end(); ++it)
+				{
+					n32 nInvalidIndex = *it;
+					map<n32, n32>::const_iterator itRelaDyn = mInitArrayRelaDynIndex.find(nInvalidIndex);
+					if (itRelaDyn == mInitArrayRelaDynIndex.end())
+					{
+						memcpy(&*vElf.begin() + static_cast<u32>(pInitArraySection->get_offset() + nInvalidIndex * 8), &*sInitArrayData.begin() + nInvalidIndex + 8, 8);
+					}
+					else
+					{
+						n32 nRelaDynIndex = itRelaDyn->second;
+						Elf64_Addr uOffset = 0;
+						Elf_Word uSymbol = 0;
+						Elf_Word uType = 0;
+						Elf_Sxword nAddend = 0;
+						if (!relaDynSection.get_entry(nRelaDynIndex, uOffset, uSymbol, uType, nAddend))
+						{
+							return 1;
+						}
+						relaDynSection.set_entry(nRelaDynIndex, uOffset, uSymbol, uType, -1);
+					}
+				}
+			}
+			memcpy(&*vElf.begin() + static_cast<u32>(pRelaDynSection->get_offset()), pRelaDynSection->get_data(), static_cast<u32>(pRelaDynSection->get_size()));
+		}
 	}
-	ofstream output;
-	output.open(argv[2], ios::out | ios::binary | ios::trunc);
-	if (!output)
+	fp = UFopen(argv[2], USTR("wb"), false);
+	if (fp == nullptr)
 	{
 		return 1;
 	}
-	elfFile.save(output);
+	fwrite(&*vElf.begin(), 1, vElf.size(), fp);
+	fclose(fp);
 	return 0;
 }
